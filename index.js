@@ -1,74 +1,137 @@
-import express from "express";
-import crypto from "crypto";
-import axios from "axios";
+import express from 'express';
+import crypto from 'crypto';
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
-
-// Read API keys from environment (set these in Cloud Run)
-const KEY = process.env.COINDCX_KEY || "";
-const SECRET = process.env.COINDCX_SECRET || "";
-
-const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
-
-function sign(body) {
-  const payload = JSON.stringify(body);
-  return crypto.createHmac("sha256", SECRET).update(payload).digest("hex");
-}
-
-app.get("/healthz", (req, res) => res.json({ ok: true, ts: Date.now() }));
-
-// Futures instruments
-app.get("/instrument", async (req, res) => {
-  try {
-    const pair = req.query.pair;
-    const url = `https://api.coindcx.com/exchange/v1/derivatives/futures/data/instrument?pair=${encodeURIComponent(pair)}`;
-    const r = await axios.get(url, { headers: { "User-Agent": UA, "Accept": "application/json" }, timeout: 8000 });
-    res.status(r.status).json(r.data);
-  } catch (e) {
-    res.status(502).json({ message: String(e.message || e) });
-  }
-});
-
-// Public futures candles (pcode=f)
-app.get("/candles", async (req, res) => {
-  try {
-    const { pair, from, to, resolution, pcode = "f" } = req.query;
-    const url = `https://public.coindcx.com/market_data/candlesticks?pair=${encodeURIComponent(pair)}&from=${from}&to=${to}&resolution=${resolution}&pcode=${pcode}`;
-    const r = await axios.get(url, { headers: { "User-Agent": UA, "Accept": "application/json" }, timeout: 8000 });
-    res.status(r.status).json(r.data);
-  } catch (e) {
-    res.status(502).json({ message: String(e.message || e) });
-  }
-});
-
-// Create market order (Futures)
-app.post("/orders/create", async (req, res) => {
-  try {
-    if (!KEY || !SECRET) return res.status(500).json({ message: "Keys not set on proxy (COINDCX_KEY/COINDCX_SECRET)" });
-    const body = req.body || {};
-    const sig = sign(body);
-    const r = await axios.post(
-      "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/create",
-      JSON.stringify(body),
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "X-AUTH-APIKEY": KEY,
-          "X-AUTH-SIGNATURE": sig,
-          "X-AUTH-TIMESTAMP": String(body.timestamp || Date.now()),
-          "User-Agent": UA,
-          "Accept": "application/json"
-        },
-        timeout: 8000,
-        validateStatus: () => true
-      }
-    );
-    res.status(r.status).send(r.data);
-  } catch (e) {
-    res.status(502).json({ message: String(e.message || e) });
-  }
-});
+app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log("CoinDCX proxy running on", PORT));
+const BASE_URL = process.env.COINDCX_BASE || 'https://api.coindcx.com';
+const API_KEY = process.env.COINDCX_KEY || '';
+const API_SECRET = process.env.COINDCX_SECRET || '';
+
+// ROOT
+app.get('/', (req, res) => {
+  res.json({ s: 'ok', m: 'coindcx proxy root' });
+});
+
+// HEALTH CHECK
+app.get('/health', (req, res) => {
+  res.json({ s: 'ok', service: 'coindcx-proxy' });
+});
+
+// SIGN REQUEST BODY
+function signBody(body) {
+  const payload = JSON.stringify(body);
+  return crypto.createHmac('sha256', API_SECRET)
+               .update(payload)
+               .digest('hex');
+}
+
+// GENERIC POST WRAPPER
+async function postToCoinDCX(path, body) {
+  const sig = signBody(body);
+
+  const response = await fetch(BASE_URL + path, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-AUTH-APIKEY': API_KEY,
+      'X-AUTH-SIGNATURE': sig
+    },
+    body: JSON.stringify(body)
+  });
+
+  const text = await response.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    json = { raw: text };
+  }
+
+  if (!response.ok) {
+    console.error('[CoinDCX ERROR]', response.status, text);
+    return { s: 'error', code: response.status, raw: json };
+  }
+
+  return { s: 'ok', data: json };
+}
+
+// FUTURES POSITIONS
+app.post('/futures/positions', async (req, res) => {
+  try {
+    const body = { timestamp: Date.now() };
+    const result = await postToCoinDCX(
+      '/exchange/v1/derivatives/futures/positions',
+      body
+    );
+    res.json(result);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ s: 'error', m: e.message });
+  }
+});
+
+// FUTURES ORDERS LIST
+app.post('/futures/orders', async (req, res) => {
+  try {
+    const body = {
+      timestamp: Date.now(),
+      status: req.body?.status || 'open',
+      page: req.body?.page || '1',
+      size: req.body?.size || '50'
+    };
+    const result = await postToCoinDCX(
+      '/exchange/v1/derivatives/futures/orders',
+      body
+    );
+    res.json(result);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ s: 'error', m: e.message });
+  }
+});
+
+// FUTURES ORDER CREATE
+app.post('/futures/orders/create', async (req, res) => {
+  try {
+    const order = req.body?.order;
+    if (!order || !order.pair || !order.side || !order.order_type) {
+      return res.status(400).json({ s: 'error', m: 'Missing order fields' });
+    }
+
+    const body = {
+      timestamp: Date.now(),
+      order
+    };
+
+    const result = await postToCoinDCX(
+      '/exchange/v1/derivatives/futures/orders/create',
+      body
+    );
+    res.json(result);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ s: 'error', m: e.message });
+  }
+});
+
+// ACCOUNT BALANCES
+app.post('/account/balances', async (req, res) => {
+  try {
+    const body = { timestamp: Date.now() };
+    const result = await postToCoinDCX(
+      '/exchange/v1/users/balances',
+      body
+    );
+    res.json(result);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ s: 'error', m: e.message });
+  }
+});
+
+// START SERVER
+app.listen(PORT, () => {
+  console.log(`CoinDCX proxy running on ${PORT}`);
+});
