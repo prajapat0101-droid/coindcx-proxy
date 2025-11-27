@@ -1,7 +1,7 @@
 {
   "name": "coindcx-proxy",
   "version": "1.0.0",
-  "description": "Simple proxy for CoinDCX candles + futures (for Google Apps Script)",
+  "description": "Simple proxy for CoinDCX candles + futures (Google Sheets compatible)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
